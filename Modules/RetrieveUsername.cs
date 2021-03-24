@@ -21,9 +21,14 @@ namespace R2DSEssentials.Modules
 
         private ConfigEntry<bool> _enableBlackListRichNames;
         private ConfigEntry<string> _blackListRichNames;
+        private ConfigEntry<string> _steamApiKey;
+        private ConfigEntry<bool> _prefixUniqueId;
 
         public static event Action OnUsernameUpdated;
 
+        public static int uniqueId = 0;
+
+        public static readonly Dictionary<ulong, int> UniqueIdCache = new Dictionary<ulong, int>();
         internal static readonly Dictionary<ulong, string> UsernamesCache = new Dictionary<ulong, string>();
         private static readonly List<ulong> RequestCache = new List<ulong>();
 
@@ -52,13 +57,20 @@ namespace R2DSEssentials.Modules
 
             _blackListRichNames = AddConfig("Rich Tag Blacklist", "size, style",
                 "Blacklist thats used for banning specific tags, only input the tag name in this. Example : size, style, color");
+
+            _prefixUniqueId = AddConfig("Prefix Unique Id", true,
+                "Prefixs a Unique Id to the players name, useful for kick systems.");
+
+            _steamApiKey = AddConfig("Steam API Key", "",
+                "Set this to your steam API key to use the steam api instead of a website.");
+
         }
 
         private string OnGetResolvedName(On.RoR2.NetworkPlayerName.orig_GetResolvedName orig, ref NetworkPlayerName self)
         {
             if (Server.Instance != null)
             {
-                return UsernamesCache.TryGetValue(self.steamId.value, out var name) ? name : GetPersonaNameWebAPI(self.steamId.value);
+                return UsernamesCache.TryGetValue(self.steamId.value, out var name) ? name : GetPersonaNameWebAPI(self.steamId.value, ref self);
             }
 
             return orig(ref self);
@@ -89,7 +101,7 @@ namespace R2DSEssentials.Modules
         }
 
         // ReSharper disable once InconsistentNaming
-        private string GetPersonaNameWebAPI(ulong steamId)
+        private string GetPersonaNameWebAPI(ulong steamId, ref NetworkPlayerName self)
         {
             const string unkString = "???";
 
@@ -99,87 +111,109 @@ namespace R2DSEssentials.Modules
             if (!RequestCache.Contains(steamId))
             {
                 RequestCache.Add(steamId);
-                PluginEntry.Instance.StartCoroutine(WebRequestCoroutine(steamId));
+                PluginEntry.Instance.StartCoroutine(WebRequestCoroutine(steamId, self));
             }
 
             return unkString;
         }
 
-        private IEnumerator WebRequestCoroutine(ulong steamId)
+        private IEnumerator WebRequestCoroutine(ulong steamId, NetworkPlayerName self)
         {
-            const string regexForLookUp = "<dt class=\"key\">name<\\/dt>\\s*<dd class=\"value\">(.*)<\\/dd>";
-
-            var ioUrlRequest = "https://steamid.io/lookup/" + steamId;
-
-            var webRequest = UnityWebRequest.Get(ioUrlRequest);
-            yield return webRequest.SendWebRequest();
-
-            if (!webRequest.isNetworkError)
+            string apiKey = _steamApiKey.Value;
+            if (apiKey != "")
             {
-                var rx = new Regex(regexForLookUp,
-                    RegexOptions.Compiled | RegexOptions.IgnoreCase);
+                var ioUrlRequest = $"http://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key={apiKey}&steamids={steamId}";
 
-                var nameFromRegex = rx.Match(webRequest.downloadHandler.text).Groups[1].ToString();
-
-                if (!nameFromRegex.Equals(""))
+                var webRequest = UnityWebRequest.Get(ioUrlRequest);
+                yield return webRequest.SendWebRequest();
+                if (!webRequest.isNetworkError)
                 {
-                    var gotBlackListed = false;
+                    var userNameJson = SimpleJSON.JSONObject.Parse(webRequest.downloadHandler.text);
+                    var userName = (string)userNameJson["response"]["players"][0]["personaname"];
+                    SyncPlayerName(steamId, self, userName);
+                }
+                else
+                {
+                    SyncPlayerName(steamId, self, "???");
+                }
+                webRequest.Dispose();
+            }
+            else
+            {
+                const string regexForLookUp = "<dt class=\"key\">name<\\/dt>\\s*<dd class=\"value\">(.*)<\\/dd>";
 
-                    if (_enableBlackListRichNames.Value)
+                var ioUrlRequest = "https://steamid.io/lookup/" + steamId;
+
+                var webRequest = UnityWebRequest.Get(ioUrlRequest);
+                yield return webRequest.SendWebRequest();
+
+                if (!webRequest.isNetworkError)
+                {
+                    var rx = new Regex(regexForLookUp,
+                        RegexOptions.Compiled | RegexOptions.IgnoreCase);
+
+                    var nameFromRegex = rx.Match(webRequest.downloadHandler.text).Groups[1].ToString();
+
+                    if (!nameFromRegex.Equals(""))
                     {
-                        var blackList = _blackListRichNames.Value.Split(',');
+                        var gotBlackListed = false;
 
-                        foreach (var tag in blackList)
+                        if (_enableBlackListRichNames.Value)
                         {
-                            var bannedTag = "&lt;" + tag + "=";
-                            if (nameFromRegex.Contains(bannedTag))
-                            {
-                                var userToKick = Util.Networking.GetNetworkUserFromSteamId(steamId);
-                                var playerId = Util.Networking.GetPlayerIndexFromNetworkUser(userToKick);
+                            var blackList = _blackListRichNames.Value.Split(',');
 
-                                Console.instance.SubmitCmd(null, $"kick {playerId}");
-                                gotBlackListed = true;
+                            foreach (var tag in blackList)
+                            {
+                                var bannedTag = "&lt;" + tag + "=";
+                                if (nameFromRegex.Contains(bannedTag))
+                                {
+                                    var userToKick = Util.Networking.GetNetworkUserFromSteamId(steamId);
+                                    var playerId = Util.Networking.GetPlayerIndexFromNetworkUser(userToKick);
+
+                                    Console.instance.SubmitCmd(null, $"kick {playerId}");
+                                    gotBlackListed = true;
+                                }
                             }
                         }
-                    }
 
-                    if (!UsernamesCache.ContainsKey(steamId) && !gotBlackListed)
-                    {
-                        UsernamesCache.Add(steamId, nameFromRegex);
-
-                        var networkUser = Util.Networking.GetNetworkUserFromSteamId(steamId);
-                        if (networkUser != null)
+                        if (!UsernamesCache.ContainsKey(steamId) && !gotBlackListed)
                         {
-                            Logger.LogInfo($"New player : {nameFromRegex} connected. (STEAM:{steamId})");
-                            networkUser.userName = nameFromRegex;
+                            UsernamesCache.Add(steamId, nameFromRegex);
 
-                            // Sync with other players by forcing dirty syncVar ?
-                            SyncNetworkUserVarTest(networkUser);
-
-                            OnUsernameUpdated?.Invoke();
+                            SyncPlayerName(steamId, self, nameFromRegex);
                         }
                     }
+                } else
+                {
+                    SyncPlayerName(steamId, self, "???"); ;
                 }
+
+                webRequest.Dispose();
             }
-
-            webRequest.Dispose();
         }
 
-        private static void SyncNetworkUserVarTest(NetworkUser currentNetworkUser)
+        private void SyncPlayerName(ulong steamId, NetworkPlayerName self, string username)
         {
-            var tmp = currentNetworkUser.Network_id;
-            var nid = NetworkUserId.FromIp("000.000.000.1", 255);
-            currentNetworkUser.Network_id = nid;
-            currentNetworkUser.SetDirtyBit(1u);
-            PluginEntry.Instance.StartCoroutine(UpdateUsernameDelayed(currentNetworkUser, tmp));
-        }
+            NetworkUser networkUser = Util.Networking.GetNetworkUserFromSteamId(steamId);
+            if (networkUser != null)
+            {
+                uniqueId++;
+                networkUser.userName = $"[{uniqueId}] {username}";
+                self.nameOverride = $"[{uniqueId}] {username}";
 
-        private static IEnumerator UpdateUsernameDelayed(NetworkUser userToUpdate, NetworkUserId realId)
-        {
-            yield return new WaitForSeconds(1);
+                UniqueIdCache.Add(steamId, uniqueId);
 
-            userToUpdate.Network_id = realId;
-            userToUpdate.SetDirtyBit(1u);
+                //NetworkWriter write = new NetworkWriter();
+                //self.Serialize(write);
+
+                //foreach (var writeNetUser in NetworkUser.readOnlyInstancesList)
+                //{
+                //    writeNetUser.connectionToClient.SendWriter(write, RoR2.Networking.QosChannelIndex.defaultUnreliable.intVal);
+                //}
+
+                Logger.LogWarning($"New player : {networkUser.userName} connected. (STEAM:{steamId})");
+                OnUsernameUpdated?.Invoke();
+            }
         }
     }
 }
