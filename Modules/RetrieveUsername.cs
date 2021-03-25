@@ -26,7 +26,7 @@ namespace R2DSEssentials.Modules
 
         public static event Action OnUsernameUpdated;
 
-        public static int uniqueId = 0;
+        private static int uniqueId = 0;
 
         public static readonly Dictionary<ulong, int> UniqueIdCache = new Dictionary<ulong, int>();
         internal static readonly Dictionary<ulong, string> UsernamesCache = new Dictionary<ulong, string>();
@@ -203,17 +203,21 @@ namespace R2DSEssentials.Modules
 
                 UniqueIdCache.Add(steamId, uniqueId);
 
-                //NetworkWriter write = new NetworkWriter();
-                //self.Serialize(write);
-
-                //foreach (var writeNetUser in NetworkUser.readOnlyInstancesList)
-                //{
-                //    writeNetUser.connectionToClient.SendWriter(write, RoR2.Networking.QosChannelIndex.defaultUnreliable.intVal);
-                //}
+                var netId = networkUser.Network_id;
+                var tempId = NetworkUserId.FromIp("000.000.000.1", 255);
+                networkUser.Network_id = tempId;
+                networkUser.SetDirtyBit(1u);
 
                 Logger.LogWarning($"New player : {networkUser.userName} connected. (STEAM:{steamId})");
                 OnUsernameUpdated?.Invoke();
+                PluginEntry.Instance.StartCoroutine(UpdateUserName(networkUser, netId));
             }
+        }
+        private static IEnumerator UpdateUserName(NetworkUser networkUser, NetworkUserId netId)
+        {
+            yield return new WaitForSeconds(0.001f);
+            networkUser.Network_id = netId;
+            networkUser.SetDirtyBit(1u);
         }
     }
 }
